@@ -1315,8 +1315,11 @@ function wrap_introspective(config::RepliBuildConfig, library_path::String, head
         metadata["function_pointer_typedefs"] = header_types["function_pointers"]
     end
 
-    # Create type registry with metadata
-    registry = create_type_registry(config)
+    # Create type registry with metadata + typedef resolution table
+    typedef_table = get(metadata, "typedef_table", Dict{String,Any}())
+    # Convert to String,String for custom_types merge
+    typedef_custom = Dict{String,String}(String(k) => String(v) for (k, v) in typedef_table if v != "Any")
+    registry = create_type_registry(config, custom_types=typedef_custom)
 
     # Generate wrapper module
     module_name = get_module_name(config)
@@ -1978,10 +1981,10 @@ function generate_introspective_module(config::RepliBuildConfig, lib_path::Strin
                 if kind == "union"
                     byte_size_str = get(struct_info, "byte_size", "0x0")
                     byte_size = parse(Int, byte_size_str)
-                    
+                    members = get(struct_info, "members", [])
+
                     if byte_size == 0
                         # Fallback if size missing
-                        members = get(struct_info, "members", [])
                         for m in members
                             m_size = get(m, "size", 0)
                             byte_size = max(byte_size, m_size)
@@ -1990,12 +1993,45 @@ function generate_introspective_module(config::RepliBuildConfig, lib_path::Strin
                     end
 
                     struct_definitions *= """
-                    # C++ union: $struct_name (size $byte_size bytes)
+                    # C union: $struct_name (size $byte_size bytes)
                     mutable struct $julia_struct_name
                         data::NTuple{$byte_size, UInt8}
                     end
-                    
+
                     """
+
+                    # Generate typed accessor functions for each union member
+                    for m in members
+                        m_name = get(m, "name", "")
+                        m_julia_type = get(m, "julia_type", "Any")
+                        if isempty(m_name) || m_julia_type == "Any"
+                            continue
+                        end
+
+                        # Sanitize member name for Julia identifier
+                        safe_m_name = replace(m_name, r"[^A-Za-z0-9_]" => "_")
+
+                        # Skip complex types (nested structs, arrays) — only primitive/pointer accessors
+                        if startswith(m_julia_type, "NTuple{") || startswith(m_julia_type, "Vector{")
+                            continue
+                        end
+
+                        struct_definitions *= """
+                        \"\"\"Get union member `$m_name` as `$m_julia_type` from `$julia_struct_name`.\"\"\"
+                        function get_$(safe_m_name)(u::$julia_struct_name)::$m_julia_type
+                            return unsafe_load(Ptr{$m_julia_type}(pointer_from_objref(u)))
+                        end
+
+                        \"\"\"Set union member `$m_name` as `$m_julia_type` in `$julia_struct_name`.\"\"\"
+                        function set_$(safe_m_name)!(u::$julia_struct_name, v::$m_julia_type)
+                            unsafe_store!(Ptr{$m_julia_type}(pointer_from_objref(u)), v)
+                        end
+
+                        """
+                        push!(exports, "get_$(safe_m_name)")
+                        push!(exports, "set_$(safe_m_name)!")
+                    end
+
                     continue
                 end
 
@@ -2008,7 +2044,98 @@ function generate_introspective_module(config::RepliBuildConfig, lib_path::Strin
                         off = get(m, "offset", "0x0")
                         isnothing(off) ? 0 : parse(Int, off)
                     end)
-                    
+
+                    # Check if this struct has bitfield members
+                    has_bitfields = any(m -> haskey(m, "bit_size"), members)
+
+                    if has_bitfields
+                        byte_size_str = get(struct_info, "byte_size", "0x0")
+                        byte_size = parse(Int, byte_size_str)
+                        if byte_size == 0; byte_size = 8; end
+
+                        struct_definitions *= """
+                        # C struct with bitfields: $struct_name (size $byte_size bytes)
+                        mutable struct $julia_struct_name
+                            _data::NTuple{$byte_size, UInt8}
+                        end
+
+                        """
+
+                        # Generate accessor functions for each member
+                        for member in members
+                            member_name = get(member, "name", "unknown")
+                            julia_type = get(member, "julia_type", "Any")
+                            safe_member = replace(member_name, r"[^A-Za-z0-9_]" => "_")
+
+                            if haskey(member, "bit_size")
+                                bit_size = member["bit_size"]
+
+                                # Determine absolute bit offset
+                                bit_offset = if haskey(member, "data_bit_offset")
+                                    member["data_bit_offset"]
+                                elseif haskey(member, "bit_offset_legacy")
+                                    byte_off = parse(Int, get(member, "offset", "0x0"))
+                                    byte_off * 8 + member["bit_offset_legacy"]
+                                else
+                                    0
+                                end
+
+                                byte_pos = bit_offset >> 3
+                                bit_within_byte = bit_offset & 7
+                                mask = (1 << bit_size) - 1
+
+                                # Getter with bit extraction
+                                if bit_size <= 8 && bit_within_byte + bit_size <= 8
+                                    # Single byte access
+                                    struct_definitions *= """
+                                    \"\"\"Get bitfield `$member_name` ($bit_size bits) from `$julia_struct_name`.\"\"\"
+                                    function get_$(safe_member)(s::$julia_struct_name)::UInt32
+                                        return UInt32((s._data[$(byte_pos + 1)] >> $bit_within_byte) & $(mask))
+                                    end
+
+                                    \"\"\"Set bitfield `$member_name` ($bit_size bits) in `$julia_struct_name`.\"\"\"
+                                    function set_$(safe_member)!(s::$julia_struct_name, v::Integer)
+                                        data = collect(s._data)
+                                        cleared = data[$(byte_pos + 1)] & ~UInt8($(mask) << $bit_within_byte)
+                                        data[$(byte_pos + 1)] = cleared | UInt8((UInt32(v) & $(mask)) << $bit_within_byte)
+                                        s._data = NTuple{$byte_size, UInt8}(data)
+                                    end
+
+                                    """
+                                else
+                                    # Multi-byte bitfield — use unsafe_load for the containing integer
+                                    struct_definitions *= """
+                                    \"\"\"Get bitfield `$member_name` ($bit_size bits) from `$julia_struct_name`.\"\"\"
+                                    function get_$(safe_member)(s::$julia_struct_name)::UInt32
+                                        p = pointer(collect(s._data)) + $byte_pos
+                                        raw = unsafe_load(Ptr{UInt32}(p))
+                                        return (raw >> $bit_within_byte) & UInt32($(mask))
+                                    end
+
+                                    """
+                                end
+                                push!(exports, "get_$(safe_member)")
+                                push!(exports, "set_$(safe_member)!")
+                            else
+                                # Non-bitfield member in a bitfield struct — byte-offset accessor
+                                byte_off = parse(Int, get(member, "offset", "0x0"))
+                                if julia_type != "Any" && !startswith(julia_type, "NTuple{")
+                                    struct_definitions *= """
+                                    \"\"\"Get non-bitfield member `$member_name` from `$julia_struct_name`.\"\"\"
+                                    function get_$(safe_member)(s::$julia_struct_name)::$julia_type
+                                        p = pointer(collect(s._data)) + $byte_off
+                                        return unsafe_load(Ptr{$julia_type}(p))
+                                    end
+
+                                    """
+                                    push!(exports, "get_$(safe_member)")
+                                end
+                            end
+                        end
+
+                        continue
+                    end
+
                     member_count = length(members)
                     struct_definitions *= """
                     # C++ struct: $struct_name ($member_count members)

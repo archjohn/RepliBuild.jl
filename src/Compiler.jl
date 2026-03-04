@@ -256,6 +256,11 @@ function create_library(config::RepliBuildConfig, ir_file::String, lib_name::Str
         "-o", lib_path
     ]
 
+    # Add library search paths
+    for dir in config.link.link_dirs
+        push!(cmd_args, "-L$dir")
+    end
+
     # Add link libraries
     for lib in config.link.link_libraries
         push!(cmd_args, "-l$lib")
@@ -572,23 +577,49 @@ function dwarf_type_to_julia(c_type::AbstractString)::String
     # Handle pointer types (T*)
     if endswith(c_type, "*")
         # Strip pointer and get base type
-        base_type = strip(replace(c_type, r"\*+$" => ""))
-        base_type = replace(base_type, "const" => "")
-        base_type = replace(base_type, "volatile" => "")
+        base_type = strip(replace(c_type, r"\*$" => ""))
+        base_type = replace(base_type, r"\bconst\b" => "")
+        base_type = replace(base_type, r"\bvolatile\b" => "")
         base_type = strip(base_type)
 
-        # Special case: char* is Cstring
-        if base_type == "char"
+        # Special case: char* / signed char* → Cstring (null-terminated C strings)
+        if base_type == "char" || base_type == "signed char"
             return "Cstring"
         end
 
-        # General pointer
-        return "Ptr{Cvoid}"  # Generic pointer, could be refined based on base_type
+        # void* → Ptr{Cvoid}
+        if base_type == "void" || isempty(base_type)
+            return "Ptr{Cvoid}"
+        end
+
+        # Nested pointers: T** → Ptr{Ptr{...}}
+        if endswith(base_type, "*")
+            inner = dwarf_type_to_julia(base_type)
+            return "Ptr{$inner}"
+        end
+
+        # Resolve base type through the type map
+        julia_base = dwarf_type_to_julia(base_type)
+        if julia_base != "Any"
+            return "Ptr{$julia_base}"
+        end
+
+        # Unknown base type — keep as Ptr{Cvoid}
+        return "Ptr{Cvoid}"
     end
 
     # Handle reference types (T&)
     if endswith(c_type, "&")
-        return "Ref{Cvoid}"  # Could be refined
+        base_type = strip(replace(c_type, r"&$" => ""))
+        base_type = replace(base_type, r"\bconst\b" => "")
+        base_type = replace(base_type, r"\bvolatile\b" => "")
+        base_type = strip(base_type)
+
+        julia_base = dwarf_type_to_julia(base_type)
+        if julia_base != "Any"
+            return "Ref{$julia_base}"
+        end
+        return "Ref{Cvoid}"
     end
 
     # Handle const/volatile qualifiers
@@ -640,7 +671,7 @@ Returns: (return_types_dict, struct_defs_dict)
   - return_types: Dict{mangled_name => {c_type, julia_type, size}}
   - struct_defs: Dict{struct_name => {members: [{name, type, offset}]}}
 """
-function extract_dwarf_return_types(binary_path::String)::Tuple{Dict{String,Dict{String,Any}}, Dict{String,Dict{String,Any}}, Dict{String,Any}}
+function extract_dwarf_return_types(binary_path::String)::Tuple{Dict{String,Dict{String,Any}}, Dict{String,Dict{String,Any}}, Dict{String,Any}, Dict{String,String}}
     println("Parsing DWARF debug info...")
 
     # Run readelf to get DWARF debug info
@@ -1047,11 +1078,19 @@ function extract_dwarf_return_types(binary_path::String)::Tuple{Dict{String,Dict
         if contains(line, "DW_AT_const_value") && haskey(type_refs, "last_tag_offset")
             tag_offset = type_refs["last_tag_offset"]
             if haskey(offset_to_kind, tag_offset) && offset_to_kind[tag_offset] in [:enumerator, :template_value]
-                # Value can be decimal or hex
-                value_match = match(r":\s*(-?\d+)", line)
+                # Value can be decimal or hex (0x...)
+                value_match = match(r":\s*(-?(?:0x[0-9a-fA-F]+|\d+))", line)
                 if !isnothing(value_match)
                     if haskey(type_refs, tag_offset) && isa(type_refs[tag_offset], Dict)
-                        type_refs[tag_offset]["value"] = parse(Int, value_match.captures[1])
+                        val_str = value_match.captures[1]
+                        val = if startswith(val_str, "0x") || startswith(val_str, "0X")
+                            parse(Int, val_str[3:end], base=16)
+                        elseif startswith(val_str, "-0x") || startswith(val_str, "-0X")
+                            -parse(Int, val_str[4:end], base=16)
+                        else
+                            parse(Int, val_str)
+                        end
+                        type_refs[tag_offset]["value"] = val
                     end
                 end
             end
@@ -1161,6 +1200,30 @@ function extract_dwarf_return_types(binary_path::String)::Tuple{Dict{String,Dict
                     end
                 end
 
+                # Bitfield: DW_AT_bit_size (number of bits in bitfield member)
+                if contains(line, "DW_AT_bit_size")
+                    bit_size_match = match(r"DW_AT_bit_size\s*:\s*(\d+)", line)
+                    if !isnothing(bit_size_match)
+                        member_info["bit_size"] = parse(Int, bit_size_match.captures[1])
+                    end
+                end
+
+                # Bitfield: DW_AT_data_bit_offset (DWARF 4+ — absolute bit offset from struct start)
+                if contains(line, "DW_AT_data_bit_offset")
+                    dbo_match = match(r"DW_AT_data_bit_offset\s*:\s*(\d+)", line)
+                    if !isnothing(dbo_match)
+                        member_info["data_bit_offset"] = parse(Int, dbo_match.captures[1])
+                    end
+                end
+
+                # Bitfield: DW_AT_bit_offset (DWARF 2/3 — offset from MSB of containing unit)
+                if contains(line, "DW_AT_bit_offset") && !contains(line, "DW_AT_data_bit_offset")
+                    bo_match = match(r"DW_AT_bit_offset\s*:\s*(\d+)", line)
+                    if !isnothing(bo_match)
+                        member_info["bit_offset_legacy"] = parse(Int, bo_match.captures[1])
+                    end
+                end
+
                 # When we have all info, add to parent struct/class
                 parent_offset = get(member_info, "parent", nothing)
                 if !isnothing(parent_offset) && haskey(type_refs, parent_offset) &&
@@ -1169,11 +1232,18 @@ function extract_dwarf_return_types(binary_path::String)::Tuple{Dict{String,Dict
                         # Only add if we haven't already added this member
                         existing_names = [m["name"] for m in type_refs[parent_offset]["members"]]
                         if !(member_info["name"] in existing_names)
-                            push!(type_refs[parent_offset]["members"], Dict(
+                            member_dict = Dict(
                                 "name" => member_info["name"],
                                 "type" => member_info["type"],
                                 "offset" => get(member_info, "offset", "0x00")
-                            ))
+                            )
+                            # Propagate bitfield attributes
+                            for bf_key in ["bit_size", "data_bit_offset", "bit_offset_legacy"]
+                                if haskey(member_info, bf_key)
+                                    member_dict[bf_key] = member_info[bf_key]
+                                end
+                            end
+                            push!(type_refs[parent_offset]["members"], member_dict)
                         end
                     end
                 end
@@ -1802,9 +1872,9 @@ function extract_dwarf_return_types(binary_path::String)::Tuple{Dict{String,Dict
     # Extract struct definitions with member information
     struct_defs = Dict{String,Dict{String,Any}}()
     for (offset, type_info) in type_refs
-        if isa(type_info, Dict) && get(type_info, "kind", nothing) in ["struct", "class"]
+        if isa(type_info, Dict) && get(type_info, "kind", nothing) in ["struct", "class", "union"]
             struct_name = get(type_info, "name", "unknown")
-            if struct_name != "unknown" && struct_name != "unknown_struct" && struct_name != "unknown_class"
+            if struct_name != "unknown" && struct_name != "unknown_struct" && struct_name != "unknown_class" && struct_name != "unknown_union"
                 # Resolve member types to Julia types
                 resolved_members = []
                 for member in get(type_info, "members", [])
@@ -1812,13 +1882,20 @@ function extract_dwarf_return_types(binary_path::String)::Tuple{Dict{String,Dict
                     if !isnothing(member_type_ref)
                         c_type = resolve_type(member_type_ref, type_refs)
                         julia_type = cpp_to_julia_type(c_type, struct_names, enum_names)
-                        push!(resolved_members, Dict(
+                        member_resolved = Dict(
                             "name" => get(member, "name", "unknown"),
                             "c_type" => c_type,
                             "julia_type" => julia_type,
                             "size" => get_type_size(c_type),
                             "offset" => get(member, "offset", "0x00")
-                        ))
+                        )
+                        # Propagate bitfield attributes if present
+                        for bf_key in ["bit_size", "data_bit_offset", "bit_offset_legacy"]
+                            if haskey(member, bf_key)
+                                member_resolved[bf_key] = member[bf_key]
+                            end
+                        end
+                        push!(resolved_members, member_resolved)
                     end
                 end
 
@@ -1952,7 +2029,29 @@ function extract_dwarf_return_types(binary_path::String)::Tuple{Dict{String,Dict
         println("    Extracted $(length(global_vars)) global variables")
     end
 
-    return (return_types, struct_defs, global_vars)
+    # Build typedef resolution table: typedef name -> resolved Julia type
+    typedef_table = Dict{String,String}()
+    for (offset, type_info) in type_refs
+        if isa(type_info, Dict) && get(type_info, "kind", nothing) == "typedef"
+            td_name = get(type_info, "name", "")
+            if !isempty(td_name)
+                target_ref = get(type_info, "target", nothing)
+                if !isnothing(target_ref)
+                    c_type = resolve_type(target_ref, type_refs)
+                    julia_type = cpp_to_julia_type(c_type, struct_names, enum_names)
+                    if julia_type != "Any"
+                        typedef_table[td_name] = julia_type
+                    end
+                end
+            end
+        end
+    end
+
+    if !isempty(typedef_table)
+        println("    Built typedef table: $(length(typedef_table)) entries")
+    end
+
+    return (return_types, struct_defs, global_vars, typedef_table)
 end
 
 """
@@ -1968,7 +2067,7 @@ function extract_compilation_metadata(config::RepliBuildConfig, source_files::Ve
     println("   Found $(length(symbols)) exported symbols")
 
     # Extract return types and struct definitions from DWARF debug info (if available)
-    (dwarf_return_types, struct_defs, global_vars) = extract_dwarf_return_types(binary_path)
+    (dwarf_return_types, struct_defs, global_vars, typedef_table) = extract_dwarf_return_types(binary_path)
 
     # Collect struct/enum names for type resolution in function signatures
     sig_struct_names = Set{String}()
@@ -2053,7 +2152,8 @@ function extract_compilation_metadata(config::RepliBuildConfig, source_files::Ve
 
         # Type mappings
         "type_registry" => type_registry,
-        "struct_definitions" => struct_defs,  # NEW: Struct member layout from DWARF
+        "struct_definitions" => struct_defs,  # Struct member layout from DWARF
+        "typedef_table" => typedef_table,      # Typedef name -> Julia type resolution
 
         # Compiler information
         "compiler_info" => Dict(
@@ -2280,9 +2380,15 @@ function cpp_to_julia_type(cpp_type::AbstractString,
     base_type = strip(base_type)
 
     if base_type in struct_names
-        # Handle pointers: Vector3* → Ptr{Vector3}
-        if contains(cpp_type, "*")
-            return "Ptr{$base_type}"
+        # Count pointer levels: sqlite3** → 2, sqlite3* → 1
+        ptr_suffix = match(r"(\*+)\s*$", cpp_type)
+        if !isnothing(ptr_suffix)
+            ptr_count = length(ptr_suffix.captures[1])
+            result = base_type
+            for _ in 1:ptr_count
+                result = "Ptr{$result}"
+            end
+            return result
         elseif contains(cpp_type, "&")
             return "Ref{$base_type}"
         else

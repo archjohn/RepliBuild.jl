@@ -52,6 +52,7 @@ struct LinkConfig
     optimization_level::String
     enable_lto::Bool
     link_libraries::Vector{String}
+    link_dirs::Vector{String}
 end
 
 """Nested struct for [binary] section"""
@@ -236,7 +237,8 @@ function parse_link_config(data::Dict)::LinkConfig
     return LinkConfig(
         opt_level,
         get(link, "enable_lto", false),
-        get(link, "link_libraries", String[])
+        get(link, "link_libraries", String[]),
+        get(link, "link_dirs", String[])
     )
 end
 
@@ -397,7 +399,7 @@ function create_default_config(toml_path::String="replibuild.toml")::RepliBuildC
         PathsConfig("src", "include", "julia", "build", ".replibuild_cache"),
         DiscoveryConfig(true, true, 10, ["build", ".git", ".cache"], true),
         CompileConfig(String[], String[], ["-std=c++17", "-fPIC"], Dict{String,String}(), true),
-        LinkConfig("2", false, String[]),
+        LinkConfig("2", false, String[], String[]),
         BinaryConfig(:shared, "", false),
         WrapConfig(true, :clang, "", true, Dict{String,Vector{Vector{String}}}()),
         LLVMConfig(:auto, ""),
@@ -470,6 +472,9 @@ function save_config(config::RepliBuildConfig)
     )
     if !isempty(config.link.link_libraries)
         link_dict["link_libraries"] = config.link.link_libraries
+    end
+    if !isempty(config.link.link_dirs)
+        link_dict["link_dirs"] = config.link.link_dirs
     end
     data["link"] = link_dict
 
