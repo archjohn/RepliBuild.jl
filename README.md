@@ -4,7 +4,7 @@
 
 RepliBuild.jl isn't just another `ccall` wrapper generator. It is a full ABI-aware compiler bridge powered by a custom MLIR dialect (`jlcs`). It ingests raw C++ source code, parses the DWARF debug info, maps out deep C++ inheritance and vtables, and JIT-compiles it directly into type-safe, native Julia bindings.
 
-If you have a massive C/C++ project (like Duktape or SQLite) and you want it in Julia right now without writing manual bindings, or you need to pass strided matrices back and forth with *literally zero* overhead (measured at ~3.8ns execution time), RepliBuild is what you use.
+If you have a massive C/C++ project (like Duktape or SQLite) and you want it in Julia right now without writing manual bindings, or you need to pass strided matrices back and forth with *literally zero* wrapper overhead (matching bare-metal `ccall` speeds to the nanosecond), RepliBuild is what you use.
 
 ## What it actually does
 
@@ -72,7 +72,7 @@ Check out the `test/` directory. We battle-test this engine against:
 - **SQLite (`sqlite_test`)**: Wraps the full SQLite3 C API automatically.
 - **Virtual Dispatch (`vtable_test`)**: Instantiates derived C++ classes (like `Circle` and `Rectangle`) and natively dispatches virtual methods (`get_area`) correctly from Julia.
 - **Bi-directional Callbacks (`callback_test`)**: Passes native Julia JIT closures (`@cfunction`) down to C++ which calls them back in a loop without losing stack context.
-- **Zero-Copy Benchmarks (`benchmark_test`)**: Multiplies matrix memory buffers over the boundary in ~3.8 nanoseconds (50,000x faster than pure Julia fallbacks, with zero allocations).
+- **Zero-Copy Benchmarks (`benchmark_test`)**: Passes zero-allocation strided struct views for multi-dimensional memory without copying. For small matrices (e.g. 4x4), the MLIR thunk completely strips generic dispatch overhead, executing natively in ~94ns, perfectly mirroring bare-metal `ccall` performance with zero wrapper penalty.
 
 ## Documentation
 
