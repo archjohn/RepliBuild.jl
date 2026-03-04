@@ -175,3 +175,12 @@ println("="^70)
 
 include("test_mlir.jl")
 include("test_stdlib_mlir.jl")
+
+println("\n" * "="^70)
+println("Running Integration Stress Tests...")
+println("="^70)
+
+include("vtable_test/verify.jl")
+include("duktape_test/test_duktape.jl")
+include("callback_test/verify.jl")
+include("benchmark_test/verify.jl")
