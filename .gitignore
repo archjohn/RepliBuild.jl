@@ -17,6 +17,9 @@ test/*/.replibuild_cache/
 # RepliBuild cache
 .replibuild_cache/
 
+# MLIR build output
+src/mlir/build/
+
 # Documentation build
 docs/build/
 

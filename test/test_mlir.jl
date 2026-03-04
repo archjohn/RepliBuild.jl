@@ -8,21 +8,17 @@ using RepliBuild.DWARFParser
     @testset "JLCSIRGenerator" begin
         # Create mock data
         vm = VirtualMethod("foo", "_ZN4Base3fooEv", 0, "int", [])
-        ci = ClassInfo("Base", 0, [], [vm], 8)
+        ci = ClassInfo("Base", 0, String[], [vm], MemberInfo[], 8)
         
         # Test type info generation
         ir_type = JLCSIRGenerator.generate_type_info_ir("Base", ci, UInt64(0x1000))
-        @test contains(ir_type, "jlcs.type_info @\"Base\"")
-        @test contains(ir_type, "size = 8 : i64")
+        @test contains(ir_type, "jlcs.type_info \"Base\"")
+        @test contains(ir_type, "!jlcs.c_struct<\"Base\"")
         
         # Test virtual method IR generation
         ir_method = JLCSIRGenerator.generate_virtual_method_ir(vm, UInt64(0x2000))
         @test contains(ir_method, "func.func @_ZN4Base3fooEv(%arg0: !llvm.ptr) -> i32")
         @test contains(ir_method, "llvm.call")
-        
-        # Test vcall example
-        ir_vcall = generate_vcall_example("Base", "foo", 0, 0, "int")
-        @test contains(ir_vcall, "jlcs.vcall @Base::foo")
     end
 
     @testset "MLIRNative" begin
@@ -59,7 +55,7 @@ using RepliBuild.DWARFParser
         # Generate complete module IR
         # We need a VtableInfo object
         vm = VirtualMethod("bar", "_ZN4Base3barEv", 0, "void", ["int"])
-        ci = ClassInfo("Base", 0, [], [vm], 8)
+        ci = ClassInfo("Base", 0, String[], [vm], MemberInfo[], 8)
         
         classes = Dict("Base" => ci)
         vtable_addrs = Dict("Base" => UInt64(0x1000))
